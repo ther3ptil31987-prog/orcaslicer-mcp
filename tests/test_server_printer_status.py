@@ -1,0 +1,422 @@
+import json
+import time
+from email.utils import formatdate
+
+import httpx
+import pytest
+import respx
+
+import orcaslicer_mcp.server as srv
+from orcaslicer_mcp.printer import target as ptarget
+from orcaslicer_mcp.printer.moonraker import MoonrakerClient
+from orcaslicer_mcp.printer.snapshot import take_snapshot
+
+P = "http://192.0.2.10"
+F = "http://x:13130"
+INFO = {"result": {"klippy_state": "ready", "klippy_connected": True, "warnings": [], "failed_components": []}}
+MCU_LOST = ("Lost communication with MCU 'mcu'\nOnce the underlying issue is corrected, use the\n"
+            "\"FIRMWARE_RESTART\" command to reset the firmware, reload the\n"
+            "config, and restart the host software.\nPrinter is shutdown\n")
+
+
+def query(webhooks=None, print_stats=None):
+    return {"result": {"eventtime": 1.0, "status": {
+        "webhooks": webhooks or {"state": "ready", "state_message": "Printer is ready"},
+        "print_stats": print_stats or {"state": "standby", "filename": "", "print_duration": 0.0,
+                                       "total_duration": 0.0, "filament_used": 0.0, "message": "", "info": {}},
+        "extruder": {"temperature": 24.9, "target": 0.0},
+        "heater_bed": {"temperature": 23.1, "target": 0.0},
+        "configfile": {"warnings": []}}}}
+
+
+def printer_routes(q=None, info=INFO, store=None, headers=None):
+    respx.get(f"{P}/server/info").mock(return_value=httpx.Response(200, json=info, headers=headers))
+    respx.get(url__startswith=f"{P}/printer/objects/query").mock(
+        return_value=httpx.Response(200, json=q or query(), headers=headers))
+    respx.get(url__startswith=f"{P}/server/gcode_store").mock(
+        return_value=httpx.Response(200, json={"result": {"gcode_store": store or []}}, headers=headers))
+
+
+@respx.mock
+async def test_status_through_the_override(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    printer_routes()
+    out = await srv.get_printer_status()
+    assert out["state"] == "idle" and out["printer"]["source"] == "override" and out["printer"]["kind"] == "klipper"
+    assert out["headline"].startswith("Idle.")
+
+
+@respx.mock
+async def test_status_found_through_the_orcaslicer_profile(monkeypatch):
+    monkeypatch.setenv("ORCA_API_TOKEN", "tok")
+    monkeypatch.setenv("ORCA_API_URL", F)
+    respx.get(f"{F}/api/v1/status").mock(return_value=httpx.Response(200, json={"presets": {"printer": "Test Printer"}}))
+    respx.post(f"{F}/api/v1/preset/config").mock(return_value=httpx.Response(200, json={
+        "name": "Test Printer", "system": False,
+        "config": {"print_host": "http://test-user:pw-secret@192.0.2.10", "host_type": "moonraker",
+                   "printhost_apikey": "not-for-the-model"}}))
+    printer_routes()
+    out = await srv.get_printer_status()
+    assert out["printer"]["source"] == "profile" and out["printer"]["profile"] == "Test Printer"
+    assert out["printer"]["url"] == P
+    dumped = json.dumps(out)
+    assert "not-for-the-model" not in dumped
+    assert "pw-secret" not in dumped and "test-user" not in dumped
+    assert ptarget.recall_remembered().url == P
+    assert "pw-secret" not in ptarget.REMEMBERED_PATH.read_text()
+    # credentials in OrcaSlicer's own address are never used: nothing sent to the printer carries them
+    sent = [c.request for c in respx.calls if c.request.url.host == "192.0.2.10"]
+    assert sent and all("authorization" not in r.headers for r in sent)
+
+
+@respx.mock
+async def test_shutdown_comes_back_fatal_with_its_hint(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    printer_routes(query(webhooks={"state": "shutdown", "state_message": MCU_LOST}))
+    out = await srv.get_printer_status()
+    assert out["state"] == "shutdown"
+    assert out["problems"][0]["severity"] == "fatal" and "switched off" in out["problems"][0]["hint"]
+
+
+@respx.mock
+async def test_klipper_disconnected_skips_the_objects_query(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    respx.get(f"{P}/server/info").mock(return_value=httpx.Response(200, json={"result": {
+        "klippy_state": "disconnected", "klippy_connected": False, "warnings": []}}))
+    objects = respx.get(url__startswith=f"{P}/printer/objects/query")
+    respx.get(url__startswith=f"{P}/server/gcode_store").mock(
+        return_value=httpx.Response(200, json={"result": {"gcode_store": []}}))
+    out = await srv.get_printer_status()
+    assert out["state"] == "offline" and objects.call_count == 0
+
+
+@respx.mock
+async def test_a_missing_console_log_is_a_note_not_a_failure(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    respx.get(f"{P}/server/info").mock(return_value=httpx.Response(200, json=INFO))
+    respx.get(url__startswith=f"{P}/printer/objects/query").mock(return_value=httpx.Response(200, json=query()))
+    respx.get(url__startswith=f"{P}/server/gcode_store").mock(return_value=httpx.Response(500))
+    out = await srv.get_printer_status()
+    assert out["state"] == "idle" and any("console" in n for n in out["notes"])
+
+
+@respx.mock
+async def test_an_unreachable_printer_is_a_structured_error(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    for url in (f"{P}/server/info", f"{P}:7125/server/info", f"{P}/api/version"):
+        respx.get(url).mock(side_effect=httpx.ConnectError("refused"))
+    out = await srv.get_printer_status()
+    assert out["error"] == "not_reachable" and len(out["tried"]) == 3 and out["hint"]
+    assert out["printer"]["source"] == "override" and out["printer"]["url"] == P
+
+
+@respx.mock
+async def test_an_error_after_the_printer_answered_still_names_it(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    printer_routes()
+    respx.get(url__startswith=f"{P}/printer/objects/query").mock(return_value=httpx.Response(500))
+    out = await srv.get_printer_status()
+    assert out["error"] == "protocol_error"
+    assert out["printer"]["source"] == "override" and out["printer"]["kind"] == "klipper"
+
+
+def _orca_down(monkeypatch):
+    monkeypatch.setenv("ORCA_API_TOKEN", "tok")
+    monkeypatch.setenv("ORCA_API_URL", F)
+    respx.get(f"{F}/api/v1/status").mock(side_effect=httpx.ConnectError("refused"))
+
+
+@respx.mock
+async def test_a_remembered_printer_says_so_and_how_long_ago(monkeypatch):
+    _orca_down(monkeypatch)
+    ptarget.remember(ptarget.PrinterTarget(url=P, source="profile", profile="Test Printer",
+                                           host_type="moonraker", kind="klipper"))
+    printer_routes()
+    out = await srv.get_printer_status()
+    assert out["printer"]["source"] == "remembered" and out["state"] == "idle"
+    assert any("remembered" in n and "isn't running" in n and "ago" in n for n in out["notes"])
+    assert not any("\u2014" in n for n in out["notes"])
+
+
+@respx.mock
+async def test_a_remembered_printer_without_a_timestamp_keeps_other_notes(monkeypatch):
+    _orca_down(monkeypatch)
+    ptarget.REMEMBERED_PATH.write_text(json.dumps({"url": P, "kind": "klipper"}))
+    respx.get(f"{P}/server/info").mock(return_value=httpx.Response(200, json=INFO))
+    respx.get(url__startswith=f"{P}/printer/objects/query").mock(return_value=httpx.Response(200, json=query()))
+    respx.get(url__startswith=f"{P}/server/gcode_store").mock(return_value=httpx.Response(500))
+    out = await srv.get_printer_status()
+    assert out["printer"]["source"] == "remembered"
+    assert any("console" in n for n in out["notes"])
+    assert any("remembered earlier" in n and "ago" not in n for n in out["notes"])
+
+
+@respx.mock
+async def test_a_garbled_remembered_timestamp_does_not_break_the_reply(monkeypatch):
+    _orca_down(monkeypatch)
+    ptarget.REMEMBERED_PATH.write_text(json.dumps({"url": P, "kind": "klipper", "found_at": "yesterday"}))
+    printer_routes()
+    out = await srv.get_printer_status()
+    assert out["state"] == "idle" and any("remembered earlier" in n for n in out["notes"])
+
+
+@pytest.mark.parametrize("bad", ["-Infinity", "Infinity", "NaN"])
+@respx.mock
+async def test_a_non_finite_remembered_timestamp_reads_as_a_missing_one(monkeypatch, bad):
+    _orca_down(monkeypatch)
+    ptarget.REMEMBERED_PATH.write_text('{"url": "%s", "kind": "klipper", "found_at": %s}' % (P, bad))
+    printer_routes()
+    out = await srv.get_printer_status()
+    assert out["state"] == "idle" and out["printer"]["source"] == "remembered"
+    assert any("remembered earlier" in n and "ago" not in n for n in out["notes"])
+
+
+def _note_for(at):
+    return srv._remembered_note(ptarget.PrinterTarget(url=P, source="remembered", kind="klipper", remembered_at=at))
+
+
+@pytest.mark.parametrize("at", [
+    10 ** 400, -(10 ** 400),              # too big for a float: float() and arithmetic raise OverflowError
+    float("nan"), float("inf"), float("-inf"),
+    1e300, -1e300, -1.7976931348623157e308,   # finite, but no calendar holds them (and no sane age)
+    True, "yesterday", None,              # not a time at all
+], ids=["huge-int", "huge-negative-int", "nan", "inf", "minus-inf", "huge-float", "huge-negative-float",
+        "most-negative-float", "bool", "text", "none"])
+def test_a_remembered_time_that_is_not_a_usable_number_reads_as_earlier(at):
+    note = _note_for(at)
+    assert "remembered earlier" in note and "ago" not in note
+    assert note == "OrcaSlicer isn't running or can't be reached, so this uses the printer remembered earlier."
+
+
+@pytest.mark.parametrize("at,text", [(120, "2 min ago"), (3 * 3600 + 60, "3 h 1 min ago"), (1.5, "1 min ago")])
+def test_a_remembered_time_that_is_a_number_says_how_long_ago(monkeypatch, at, text):
+    monkeypatch.setattr(srv.time, "time", lambda: 1_000_000.0)
+    note = _note_for(1_000_000.0 - at)
+    assert note == f"OrcaSlicer isn't running or can't be reached, so this uses the printer remembered {text}."
+
+
+def test_a_remembered_time_in_the_future_does_not_go_negative(monkeypatch):
+    monkeypatch.setattr(srv.time, "time", lambda: 1_000_000.0)
+    assert _note_for(1_000_500.0).endswith("remembered 1 min ago.")  # a skewed clock: never a negative age
+
+
+@respx.mock
+async def test_a_huge_integer_remembered_time_does_not_break_the_reply(monkeypatch):
+    _orca_down(monkeypatch)
+    ptarget.REMEMBERED_PATH.write_text('{"url": "%s", "kind": "klipper", "found_at": %s}' % (P, "9" * 400))
+    printer_routes()
+    out = await srv.get_printer_status()
+    assert out["state"] == "idle" and out["printer"]["source"] == "remembered"
+    assert any("remembered earlier" in n and "ago" not in n for n in out["notes"])
+
+
+@pytest.mark.parametrize("bad", ["-1e300", "1e300", "-1.7976931348623157e308"])
+@respx.mock
+async def test_an_absurd_finite_remembered_time_does_not_put_a_huge_age_in_the_note(monkeypatch, bad):
+    # This one survives recall_remembered (it is a finite float) and used to become a ~310-character age.
+    _orca_down(monkeypatch)
+    ptarget.REMEMBERED_PATH.write_text('{"url": "%s", "kind": "klipper", "found_at": %s}' % (P, bad))
+    printer_routes()
+    out = await srv.get_printer_status()
+    assert out["state"] == "idle" and out["printer"]["source"] == "remembered"
+    assert ptarget.recall_remembered().remembered_at == float(bad)  # it did reach the note as a number
+    note = next(n for n in out["notes"] if "remembered" in n)
+    assert note == "OrcaSlicer isn't running or can't be reached, so this uses the printer remembered earlier."
+    assert len(note) < 100
+
+
+@respx.mock
+async def test_an_unreachable_remembered_printer_is_named_in_the_error(monkeypatch):
+    _orca_down(monkeypatch)
+    ptarget.REMEMBERED_PATH.write_text(json.dumps({"url": P, "kind": "klipper"}))
+    for url in (f"{P}/server/info", f"{P}:7125/server/info", f"{P}/api/version"):
+        respx.get(url).mock(side_effect=httpx.ConnectError("refused"))
+    out = await srv.get_printer_status()
+    assert out["error"] == "not_reachable" and out["printer"]["source"] == "remembered"
+
+
+# --- the console is read on the printer's own clock --------------------------------------------
+
+def _dated(t):
+    return {"Date": formatdate(t, usegmt=True)}
+
+
+@respx.mock
+async def test_console_errors_use_the_printers_clock_when_it_runs_behind(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    printer_now = time.time() - 3600
+    line = {"message": "!! Test error", "time": printer_now - 120, "type": "response"}
+    printer_routes(store=[line], headers=_dated(printer_now))
+    out = await srv.get_printer_status()
+    assert [p["message"] for p in out["problems"] if p["source"] == "console"] == ["Test error"]
+
+
+@respx.mock
+async def test_old_console_errors_stay_old_when_the_printer_clock_runs_ahead(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    printer_now = time.time() + 3600
+    line = {"message": "!! Test error", "time": printer_now - 3600, "type": "response"}  # an hour old
+    printer_routes(store=[line], headers=_dated(printer_now))
+    out = await srv.get_printer_status()
+    assert [p for p in out["problems"] if p["source"] == "console"] == []
+
+
+@respx.mock
+async def test_an_explicit_now_beats_the_printers_clock():
+    host_now = time.time()
+    printer_now = host_now - 3600
+    line = {"message": "!! Test error", "time": printer_now - 120, "type": "response"}
+    printer_routes(store=[line], headers=_dated(printer_now))
+    target = ptarget.PrinterTarget(url=P, source="override", kind="klipper")
+    async with MoonrakerClient(P) as c:
+        by_host_clock = await take_snapshot(target, c, now=host_now)
+        by_printer_clock = await take_snapshot(target, c, now=printer_now)
+    assert [p for p in by_host_clock["problems"] if p["source"] == "console"] == []
+    assert len([p for p in by_printer_clock["problems"] if p["source"] == "console"]) == 1
+
+
+# --- file metadata is read fresh each time ------------------------------------------------------
+
+PRINTING = {"state": "printing", "filename": "test-part.gcode", "print_duration": 100.0,
+            "total_duration": 110.0, "filament_used": 50.0, "message": "", "info": {}}
+
+
+def _meta(est):
+    return httpx.Response(200, json={"result": {"estimated_time": est, "first_layer_height": 0.2}})
+
+
+@respx.mock
+async def test_a_reuploaded_file_is_measured_against_its_new_estimate(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    printer_routes(query(print_stats=PRINTING))
+    meta = respx.get(url__startswith=f"{P}/server/files/metadata").mock(side_effect=[_meta(1000), _meta(2000)])
+    first = await srv.get_printer_status()
+    second = await srv.get_printer_status()
+    assert meta.call_count == 2
+    assert first["job"]["remaining_s"] == 900 and first["job"]["remaining_basis"] == "slicer_estimate"
+    assert second["job"]["remaining_s"] == 1900 and second["job"]["remaining_basis"] == "slicer_estimate"
+
+
+@respx.mock
+async def test_a_missing_file_record_is_not_remembered(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    printer_routes(query(print_stats=PRINTING))
+    respx.get(url__startswith=f"{P}/server/files/metadata").mock(side_effect=[httpx.Response(404), _meta(1000)])
+    first = await srv.get_printer_status()
+    second = await srv.get_printer_status()
+    assert first["job"]["remaining_basis"] != "slicer_estimate"
+    assert second["job"]["remaining_s"] == 900 and second["job"]["remaining_basis"] == "slicer_estimate"
+
+
+# --- the snapshot reuses the /server/info reply the probe just got ----------------------------------------
+
+def _info_gets():
+    return sum(1 for c in respx.calls if c.request.url.path == "/server/info")
+
+
+@respx.mock
+async def test_get_printer_status_asks_for_server_info_once(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    info = {"result": {**INFO["result"], "warnings": ["Test setup warning"]}}
+    printer_routes(info=info)
+    out = await srv.get_printer_status()
+    assert _info_gets() == 1  # the probe's own request, not a second one for the snapshot
+    assert any(p["message"] == "Test setup warning" for p in out["problems"])  # and its content was used
+
+
+@respx.mock
+async def test_a_wait_that_returns_at_once_asks_for_server_info_once(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    printer_routes()
+    out = await srv.wait_for_printer("finished", 5)
+    assert out["note"] == "nothing is printing"
+    assert _info_gets() == 1
+
+
+@respx.mock
+async def test_only_the_first_snapshot_on_a_client_reuses_the_probes_reply():
+    printer_routes()
+    found, client = await ptarget.open_printer(ptarget.PrinterTarget(url=P, source="override"))
+    async with client:
+        await take_snapshot(found, client)
+        assert _info_gets() == 1
+        await take_snapshot(found, client)  # a later wait poll must see the printer as it is now
+        assert _info_gets() == 2
+
+
+@respx.mock
+async def test_a_later_poll_sees_klipper_go_down_not_the_probes_old_reply():
+    printer_routes()
+    found, client = await ptarget.open_printer(ptarget.PrinterTarget(url=P, source="override"))
+    async with client:
+        first = await take_snapshot(found, client)
+        assert first["state"] == "idle"
+        respx.get(f"{P}/server/info").mock(return_value=httpx.Response(200, json={"result": {
+            "klippy_state": "disconnected", "klippy_connected": False, "warnings": []}}))
+        objects = respx.get(url__startswith=f"{P}/printer/objects/query")
+        before = objects.call_count
+        second = await take_snapshot(found, client)
+    assert second["state"] == "offline" and objects.call_count == before
+
+
+@respx.mock
+async def test_a_snapshot_on_a_client_that_never_probed_still_asks():
+    printer_routes()
+    target = ptarget.PrinterTarget(url=P, source="override", kind="klipper")
+    async with MoonrakerClient(P) as c:
+        await take_snapshot(target, c)
+    assert _info_gets() == 1
+
+
+@respx.mock
+async def test_a_server_info_failure_after_the_probe_is_still_only_a_note():
+    printer_routes()
+    found, client = await ptarget.open_printer(ptarget.PrinterTarget(url=P, source="override"))
+    async with client:
+        await take_snapshot(found, client)  # spends the probe's reply
+        respx.get(f"{P}/server/info").mock(return_value=httpx.Response(500))
+        out = await take_snapshot(found, client)
+    assert out["state"] == "idle" and any("warnings" in n for n in out["notes"])
+
+
+# --- errors found before the printer is known still say where the address came from -----------------------
+
+@respx.mock
+async def test_a_bad_override_error_names_the_override(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", "http://192.0.2.10:abc")
+    out = await srv.get_printer_status()
+    assert out["error"] == "not_configured" and out["printer"] == {"source": "override"}
+
+
+@respx.mock
+async def test_orca_down_and_nothing_remembered_names_the_profile_as_the_source(monkeypatch):
+    _orca_down(monkeypatch)
+    out = await srv.get_printer_status()
+    assert out["error"] == "orca_unreachable" and out["printer"] == {"source": "profile"}
+
+
+@respx.mock
+async def test_an_unsupported_profile_names_the_profile_in_the_error(monkeypatch):
+    monkeypatch.setenv("ORCA_API_TOKEN", "tok")
+    monkeypatch.setenv("ORCA_API_URL", F)
+    respx.get(f"{F}/api/v1/status").mock(return_value=httpx.Response(200, json={"presets": {"printer": "Test Printer"}}))
+    respx.post(f"{F}/api/v1/preset/config").mock(return_value=httpx.Response(200, json={
+        "name": "Test Printer", "system": False, "config": {"print_host": P, "host_type": "duet"}}))
+    out = await srv.get_printer_status()
+    assert out["error"] == "unsupported_connection"
+    assert out["printer"] == {"source": "profile", "profile": "Test Printer"}
+
+
+@respx.mock
+async def test_a_non_ascii_api_key_comes_back_as_a_not_configured_error_without_any_request(monkeypatch):
+    monkeypatch.setenv("ORCA_PRINTER_URL", P)
+    monkeypatch.setenv("ORCA_PRINTER_API_KEY", "test-“key”")  # a curly quote from a word processor
+    printer = respx.route(url__startswith=P).mock(return_value=httpx.Response(500))
+    out = await srv.get_printer_status()
+    assert out["error"] == "not_configured"
+    assert out["message"] == ("ORCA_PRINTER_API_KEY contains characters that can't be sent in an HTTP header "
+                              "(only plain ASCII works).")
+    assert out["printer"]["url"] == P and out["printer"]["source"] == "override"
+    assert printer.call_count == 0  # nothing was sent
+    dumped = json.dumps(out, ensure_ascii=False)
+    assert "test-" not in dumped and "“" not in dumped

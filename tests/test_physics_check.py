@@ -77,7 +77,7 @@ def test_all_checks_always_present():
     names = {r.name for r in run_checks({})}
     assert names == {"flow_ceiling", "temp_vs_flow", "layer_height_ratio",
                      "line_width_ratio", "retraction_range", "cooling_sanity",
-                     "first_layer_height", "initial_layer_temp"}
+                     "first_layer_height", "initial_layer_temp", "gcode_scripts"}
     assert all(r.status == "warn" for r in run_checks({}))
 
 def test_zero_flow_demand_passes_temp_check():
@@ -144,3 +144,11 @@ def test_predicted_flows_per_feature():
 def test_predicted_flows_skips_unparseable():
     cfg = {"layer_height": "0.5", "nozzle_diameter": "0.8", "outer_wall_speed": ""}
     assert predicted_flows(cfg) == {}
+
+
+def test_every_check_declares_its_preset_layers():
+    from orcaslicer_mcp.physics_check import run_checks, CHECK_LAYERS
+    names = {r.name for r in run_checks({})}
+    assert names, "run_checks({}) should still emit one result per check"
+    assert names <= set(CHECK_LAYERS), names - set(CHECK_LAYERS)
+    assert all(v <= {"print", "filament", "printer"} and v for v in CHECK_LAYERS.values())

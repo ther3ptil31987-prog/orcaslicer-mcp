@@ -52,3 +52,18 @@ def test_setting_resource_real_and_unknown():
     assert '"layer_height"' in body or "layer_height" in body
     with pytest.raises(Exception):
         _read("orca://setting/definitely_not_a_setting")
+
+
+def test_slicing_prompts_consult_outcome_memory():
+    a = srv.prompt_slice_a_model("/tmp/x.stl")
+    assert "recall_prints" in a and "save_gcode" in a
+    assert a.index("recall_prints") < a.index("slice_and_wait")
+    b = srv.prompt_optimize_print_time("cube")
+    assert "recall_prints" in b
+
+
+def test_slice_prompt_calls_describe_plate_after_slicing():
+    msgs = anyio.run(lambda: srv.mcp.get_prompt("slice-a-model", {"model_path": "/tmp/cube.stl"}))
+    text = msgs.messages[0].content.text
+    assert "describe_plate" in text
+    assert text.index("slice_and_wait") < text.index("describe_plate")

@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from .gcode_audit import audit as audit_scripts
+
 @dataclass(frozen=True)
 class CheckResult:
     name: str
@@ -79,6 +81,24 @@ def predicted_flows(cfg: dict) -> dict[str, float]:
             continue
         out[speed_k.removesuffix("_speed")] = sp * cross_section(w, lh)
     return out
+
+# Which preset layers feed each check. edit_preset uses this so an edit to ONE
+# preset is only blocked by checks it can be responsible for: a filament preset is
+# meant to pair with many print presets, so a check that mixes filament inputs with
+# the currently selected print preset's speeds is reported as a cross-layer warning
+# rather than a block. Print-preset edits ARE blocked by those same checks, since a
+# print preset is tuned for the filament that is selected while editing it.
+CHECK_LAYERS: dict[str, frozenset[str]] = {
+    "flow_ceiling":       frozenset({"print", "filament", "printer"}),  # speeds/widths/layer x filament ceiling
+    "temp_vs_flow":       frozenset({"print", "filament", "printer"}),  # demand from print speeds vs filament temp
+    "layer_height_ratio": frozenset({"print", "printer"}),
+    "line_width_ratio":   frozenset({"print", "printer"}),
+    "retraction_range":   frozenset({"printer"}),                       # retraction_length / use_firmware_retraction
+    "cooling_sanity":     frozenset({"filament"}),                      # fan_min/max, slow_down_layer_time
+    "first_layer_height": frozenset({"print", "printer"}),
+    "initial_layer_temp": frozenset({"filament"}),
+    "gcode_scripts":      frozenset({"printer"}),                       # machine start/end G-code text
+}
 
 def run_checks(cfg: dict[str, str]) -> list[CheckResult]:
     out: list[CheckResult] = []
@@ -189,4 +209,10 @@ def run_checks(cfg: dict[str, str]) -> list[CheckResult]:
                 f"first-layer nozzle {t_init:g}C >= bulk {t_bulk:g}C"))
     else:
         out.append(CheckResult("initial_layer_temp", "warn", "insufficient data (nozzle_temperature/initial_layer)"))
+
+    # gcode_scripts: a static read of the start/end G-code (gcode_audit.py). Heuristic, so it only ever warns.
+    status, findings = audit_scripts(cfg)
+    out.append(CheckResult("gcode_scripts", status, "; ".join(findings) if findings else
+                           "start and end G-code: homing, temperatures from placeholders, positioning mode and "
+                           "heaters off look right (macros on the printer are not checked)"))
     return out

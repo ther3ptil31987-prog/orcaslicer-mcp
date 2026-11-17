@@ -1,0 +1,74 @@
+# Traps that cost retries
+
+## Per-filament values and the order of edits
+
+- `get_config(keys=["hot_plate_temp"])` on a five-slot printer returns `"70,100,70,70,35"`: one value per
+  loaded slot. Writing that list back is refused (`per_filament_length_mismatch`). `set_config` takes one
+  value and writes it into the filament preset open in the Filament tab; every slot loaded with that preset
+  then has it. `list_presets(type="filament")` marks the open one `selected`.
+- On a build with the `filament_slots` capability, `set_config(changes, filament_slot=n)` writes slot n's
+  preset without any of this; `save_preset(..., filament_slot=n)` moves only slot n to the saved name (a
+  plain save moves every slot that used the old preset). Both are refused with `filament_edits_unsaved`
+  when the Filament tab holds unsaved edits to a different preset: save or revert those first.
+- Otherwise, to change another slot's value, `select_preset(type="filament", name=...)` for it first. Selecting any preset
+  discards the unsaved edits of the print and printer groups too (the reply lists `discarded_changes`), so do
+  filament work first, print edits second, slice last. `save_preset` first if an edit must survive.
+- Setting a per-filament key to `null` with several different filament presets loaded is refused as
+  ambiguous: set the value you want instead.
+
+## Objects and plates
+
+- Object tools take the stable `id` from `list_objects` (not the list position). Ids survive deleting other
+  objects.
+- Plate tools take the 0-based plate index. Deleting a plate renumbers the later ones.
+- `arrange_plate` is OrcaSlicer's Arrange all: it re-packs every unlocked plate together and deletes empty
+  plates at the end. To move one object use `transform_object` (`translate` is relative mm, `rotate` relative
+  degrees, `scale` an absolute factor) or `move_object_to_plate`.
+- On the build, with several OrcaSlicer windows open, the connection talks to the first one. Call `list_objects` right before
+  slicing if the user may have edited the plate.
+
+## The plugin's slice reading
+
+- The plugin learns about a slice from OrcaSlicer's slice messages, one slice per plate. After a change on the
+  plate or in the settings, `get_slice_status` says the slice is out of date and `get_gcode` answers
+  `not_sliced` until the user slices again.
+- It cannot see plate settings (a plate's own bed type, print sequence, spiral vase), OrcaSlicer's slice
+  warnings, or time per feature. `describe_plate`'s `settings_check` shows when a plate setting changed what
+  was sliced.
+
+## A Bambu Lab printer is read through OrcaSlicer, not over the network
+
+`get_printer_status` and `wait_for_printer` on a Bambu Lab profile read the state OrcaSlicer's own connection keeps,
+so they need OrcaSlicer open with the printer selected in its Device tab and the OrcaSlicer MCP build with
+`bambu_status`. "Offline" there means OrcaSlicer has lost the printer, not that the printer is off: the hint says
+to check the printer and reselect it. A stopped job is `cancelled` when the printer reports no error code or its
+"The task was canceled." code (0300-400C), and `error` otherwise; relay the code with the printer's own sentence
+for it (and the HMS wiki link), never a guessed cause. The headline starts with the name of the printer read, the
+one selected in the Device tab; a warning says when its model differs from the printer profile's.
+`list_print_history` is not available: Bambu printers keep no history OrcaSlicer can read.
+
+## Bambu AMS mapping takes the type word literally
+
+- OrcaSlicer's Send dialog maps a filament to a tray only when the AMS's type word equals the slot preset's
+  `filament_type`. The AMS calls Polymaker LW-ASA `ASA-Aero`; a slot whose preset says `ASA` is left without a
+  tray, and `get_filament_slot_mapping` reports it as a soft match with the candidate trays. Nothing is wrong with
+  the spool: tell the user both names and let them pick the tray in the Send dialog, or switch the slot to the
+  preset that matches the spool (`set_filament_slot_preset`).
+- A fibre filled spool (`PLA-CF`, `PA6-GF`) is never offered for an unfilled slot, nor the other way round: it
+  wears a standard nozzle. The warning names the tray; the fix is the right spool or the slot's preset.
+- The tray tools read the printer selected in OrcaSlicer's Device tab, not the printer profile's address, so
+  `no_printer_selected` and `printer_offline` are fixed there, or with `select_printer` on a build that has it.
+  Right after a switch the printer is `printer_offline` for a few seconds while OrcaSlicer connects.
+- The Device tab's selection and the active printer profile are independent: `select_printer` does not change the
+  profile, and `select_preset` on the printer group does not change the Device tab. `select_printer` reports a
+  model mismatch as `profile_check`; it is the user's call.
+- Selecting a two-nozzle printer (H2D) whose model matches the printer profile does what a click does there too:
+  the next time the user opens the Prepare tab, OrcaSlicer syncs the printer profile's nozzle setup from the
+  printer. Say so when you switch to one.
+
+## Checks are heuristics, not measurements
+
+- `check_profile_physics`' `gcode_scripts` reads the start and end G-code text. It trusts a printer macro
+  (PRINT_START and the like) to home and heat, because the macro lives on the printer.
+- A `forecast` comes from how the user's past prints compared with their estimates; with few prints there is
+  none.

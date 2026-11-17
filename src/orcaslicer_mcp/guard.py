@@ -1,0 +1,225 @@
+"""Config key guard: keep the assistant away from config keys that run code, drive the printer
+directly, or redirect uploads.
+
+The OrcaSlicer MCP build's PUT /api/v1/config accepts any print, filament or printer key.
+Some of those keys are not slicing settings at all:
+
+- post_process: shell commands OrcaSlicer runs after export (arbitrary code execution).
+- *_gcode templates: raw G-code sent to the printer (on Klipper, macros can reach the host),
+  and *_gcodes lists of them (imex_mode_gcodes, OrcaSlicer 2.5).
+- slicing_pipeline_plugin / plugins (OrcaSlicer 2.5): Python plugins run at each slicing
+  step, and the plugins a preset brings with it (arbitrary code execution).
+- the physical-printer keys (print_host, printhost_*, host_type, printer_agent, ...): where
+  "send to printer" uploads, how it connects, and with which credentials.
+- printer_model / printer_technology: can switch OrcaSlicer onto code paths that run
+  post_process on every slice.
+
+An assistant holding the API token is steerable by text it reads (model names, G-code,
+web pages), so these keys are refused here, before the request reaches OrcaSlicer. Writing
+a key back to the value it already has is allowed, so restore paths keep working; the
+connection keys OrcaSlicer never reports (UNREADABLE_KEYS) cannot be shown unchanged, so
+they are always refused, unless the user allows them.
+
+The user allows them with one tick: Preferences > Remote API > "Allow script, G-code and
+connection edits" in the OrcaSlicer MCP build. The client reads it from /status
+(sensitive_keys_allowed, at most a few seconds old) and lets these keys through when it is on;
+OrcaSlicer MCP v2.4.2-mcp.10 and later enforce the same box inside the slicer. When /status
+can't be read, or OrcaSlicer runs the OrcaSlicer MCP plugin (which never allows them), they are
+refused. Advanced: ORCA_MCP_ALLOW_KEYS (comma separated, wildcards such as *_gcode allowed)
+lets listed keys past this connector whatever the box says, for setups that need it; the build
+still applies its own box. Refusals don't mention it.
+
+This guard only covers the MCP's own tools. A client that can run shell commands can still
+reach OrcaSlicer directly with the token.
+"""
+from __future__ import annotations
+import fnmatch
+import os
+import re
+
+from .errors import ApiError
+
+# OrcaSlicer's physical-printer options (s_PhysicalPrinter_opts in libslic3r/Preset.cpp,
+# 2.4.2, minus the preset_name(s) bookkeeping): where and how "send to printer" connects.
+PHYSICAL_PRINTER_KEYS = frozenset({
+    "printer_technology",
+    "bbl_use_printhost",
+    "host_type",
+    "printer_agent",
+    "print_host",
+    "print_host_webui",
+    "printhost_apikey",
+    "flashforge_serial_number",
+    "printhost_cafile",
+    "printhost_port",
+    "printhost_authorization_type",
+    "printhost_user",
+    "printhost_password",
+    "printhost_ssl_ignore_revoke",
+})
+
+# slicing_pipeline_plugin and plugins arrived in OrcaSlicer 2.5: Python plugins that run at each
+# slicing step, and the plugin capabilities a preset references.
+BLOCKED_EXACT = PHYSICAL_PRINTER_KEYS | {"post_process", "printer_model", "filename_format",
+                                         "slicing_pipeline_plugin", "plugins"}
+
+# Keys ending in _gcode that are plain toggles, not G-code templates.
+# high_precision_gcode is a 2.5 toggle; skip_modified_gcodes is a command-line switch.
+_GCODE_SUFFIX_EXEMPT = frozenset({"emit_machine_limits_to_gcode", "high_precision_gcode",
+                                  "skip_modified_gcodes"})
+
+# GET /config never reports these (PresetBundle::full_config_secure erases them; the G-code
+# footer bans the same list), so a write can never be shown to leave them unchanged.
+UNREADABLE_KEYS = frozenset({
+    "print_host", "print_host_webui", "printhost_apikey", "printhost_cafile",
+    "printhost_user", "printhost_password", "printhost_port",
+})
+
+# What get_preset_config hides: credentials outright, and any user:password inside a host
+# URL (the print_host tooltip documents https://user:password@host/). The host itself, the
+# CA file path and the port stay visible so upload problems remain diagnosable. Keep
+# _strip_userinfo in step with strip_url_userinfo() in the fork's RemoteAPIController.cpp.
+CREDENTIAL_KEYS = frozenset({"printhost_apikey", "printhost_password", "printhost_user"})
+URL_KEYS = frozenset({"print_host", "print_host_webui"})
+REDACTED = "<redacted>"
+
+# A leading RFC 3986 scheme. It has to start the value and be letters, so in
+# "user:pa://ss@host" the "user:pa" is not mistaken for one.
+_URL_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+PREFERENCES_BOX = "Allow script, G-code and connection edits"
+
+
+class BlockedKey(ApiError):
+    """A write this connector refuses: the OrcaSlicer MCP build's Preferences box is off (or could
+    not be read), or OrcaSlicer runs the plugin, which never allows these keys. The text is written
+    for the assistant to relay as one plain step."""
+
+    def __init__(self, keys: list[str], plugin: bool = False, status_unknown: bool = False):
+        self.keys = sorted(keys)
+        self.plugin = plugin
+        listed = ", ".join(self.keys)
+        if plugin:
+            # The OrcaSlicer MCP plugin (stock OrcaSlicer) has no Remote API Preferences and never
+            # allows these keys.
+            super().__init__(
+                "blocked_by_local_policy: these settings can't be changed through the OrcaSlicer MCP "
+                "plugin: " + listed + ". Scripts, custom G-code, slicing plugins, printer connection "
+                "settings and the printer model can run code or drive the printer, and the plugin never "
+                "lets the assistant change them. Ask the user to make this change in the OrcaSlicer window.")
+            return
+        unknown = (" (OrcaSlicer's settings couldn't be read just now, so this stays locked.)"
+                   if status_unknown else "")
+        super().__init__(
+            "blocked_by_local_policy: " + listed + " is locked. Scripts, custom G-code, slicing "
+            "plugins, printer connection settings and the printer model can run code or drive the "
+            "printer, so the assistant may change them only when the user allows it. Ask the user to "
+            f"tick '{PREFERENCES_BOX}' in OrcaSlicer's Preferences > Remote API, then ask again; or to "
+            "make this change themselves in the OrcaSlicer window." + unknown)
+
+
+class RedactedValue(ApiError):
+    def __init__(self, keys: list[str]):
+        self.keys = sorted(keys)
+        super().__init__(
+            "redacted_placeholder: the value for " + ", ".join(self.keys) + " contains "
+            + REDACTED + ", which get_preset_config shows in place of a credential. Writing "
+              "it back would replace the real value; ask the user to enter it in the "
+              "OrcaSlicer GUI.")
+
+
+def _allow_entries() -> list[str]:
+    raw = os.environ.get("ORCA_MCP_ALLOW_KEYS", "")
+    if raw.strip().startswith("${"):  # Claude Desktop left the optional setting unsubstituted
+        return []
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+def _allowed(key: str, entries: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(key, e) for e in entries)
+
+
+def allow_override_warnings() -> list[str]:
+    """ORCA_MCP_ALLOW_KEYS entries that can never take effect: a plain name that is not a
+    protected key (usually a typo). Wildcard entries are taken as written."""
+    return [f"ORCA_MCP_ALLOW_KEYS: {e!r} is not a protected config key, so it has no effect"
+            for e in _allow_entries()
+            if not any(c in e for c in "*?[") and not is_sensitive(e)]
+
+
+def is_sensitive(key: str) -> bool:
+    if key in BLOCKED_EXACT or key.startswith("printhost_"):
+        return True
+    # *_gcodes: lists of templates, e.g. imex_mode_gcodes (2.5).
+    return key.endswith(("_gcode", "_gcodes")) and key not in _GCODE_SUFFIX_EXEMPT
+
+
+def sensitive_keys(changes: dict) -> list[str]:
+    allow = _allow_entries()
+    return [k for k in changes if is_sensitive(k) and not _allowed(k, allow)]
+
+
+def check_placeholders(changes: dict) -> None:
+    """Refuse any value carrying the redaction marker (a model round-tripping a redacted
+    preset), whatever the key, so a placeholder never overwrites a real credential."""
+    hits = [k for k, v in (changes or {}).items() if isinstance(v, str) and REDACTED in v]
+    if hits:
+        raise RedactedValue(hits)
+
+
+def as_config_text(v) -> str | None:
+    """The text the fork's PUT /config deserializes for this JSON value (its
+    json_value_to_config_string), or None for a type it rejects (lists, objects, null)."""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return format(v, "g")  # C++ ostream default: 6 significant digits, like %g
+    if isinstance(v, str):
+        return v
+    return None
+
+
+def unchanged(new, current) -> bool:
+    """True only when the write would hand OrcaSlicer exactly the text it already reports
+    for the key. Anything else (including a value that merely means the same) counts as a
+    change, so the guard errs towards refusing."""
+    text = as_config_text(new)
+    return text is not None and current is not None and text == current
+
+
+def changed_keys(changes: dict, hits: list[str], current: dict) -> list[str]:
+    return [k for k in hits if k in UNREADABLE_KEYS or not unchanged(changes[k], current.get(k))]
+
+
+def _strip_userinfo(url: str) -> str:
+    """Replace everything between the scheme and the LAST "@" with the placeholder.
+
+    A host never contains "@", while a password may contain "@", "/", "?", "#" or spaces,
+    so cutting at the last one hides all of them. A URL with an "@" in its path loses the
+    part before it as well: it cannot be told apart from a password containing "/", and
+    over-redacting a rare URL is the safe way to be wrong."""
+    at = url.rfind("@")
+    if at < 0:
+        return url
+    scheme = _URL_SCHEME.match(url)
+    return (scheme.group(0) if scheme else "") + REDACTED + url[at:]
+
+
+def redact_secrets(cfg: dict) -> dict:
+    """Hide credentials in a preset config before it reaches the model."""
+    if not isinstance(cfg, dict):
+        return cfg
+    out = {}
+    for k, v in cfg.items():
+        if k in CREDENTIAL_KEYS and v not in (None, "", []):
+            out[k] = REDACTED
+        elif k in URL_KEYS and isinstance(v, str):
+            out[k] = _strip_userinfo(v)
+        elif isinstance(v, dict):
+            out[k] = redact_secrets(v)
+        else:
+            out[k] = v
+    return out
