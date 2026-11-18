@@ -5,7 +5,7 @@
 # name = "OrcaSlicer MCP"
 # description = "Lets an AI assistant read your OrcaSlicer setup, change settings and read the slices you make, through the orcaslicer-mcp server. Loading models, starting a slice, plates, renders and projects need the OrcaSlicer MCP build."
 # author = "Max Ellis"
-# version = "0.2.3"
+# version = "0.2.4"
 # ///
 """OrcaSlicer MCP: part of the OrcaSlicer MCP Remote API, served by a plugin on stock OrcaSlicer 2.5.
 
@@ -24,8 +24,8 @@ Every other route answers 404 with "backend": "plugin", so orcaslicer-mcp can sa
 OrcaSlicer MCP build.
 
 How it runs:
-  * on_load starts one HTTP server thread on 127.0.0.1 (port 13130 unless settings.json in the plugin
-    folder says otherwise). The token is in token.txt in the same folder and shown in the panel.
+  * on_load starts one HTTP server thread on 127.0.0.1 (port 13131, next to the OrcaSlicer MCP build's
+    13130, unless the Config tab or settings.json in the plugin folder says otherwise). The token is in token.txt in the same folder and shown in the panel.
   * OrcaSlicer's model and presets may only be read on the UI thread, and a plugin can only run Python
     there from a UI callback. The "OrcaSlicer MCP" panel is that callback: the server thread queues a
     read, posts to the panel, the panel's page posts back, and on_message (UI thread) runs the read.
@@ -58,8 +58,15 @@ import urllib.parse
 
 import orca
 
-PLUGIN_VERSION = "0.2.3"
-DEFAULT_PORT = 13130
+PLUGIN_VERSION = "0.2.4"
+# The OrcaSlicer MCP build serves on 13130, so the plugin uses the port after it: a stock OrcaSlicer with the plugin
+# and the build can then be open together, each with its own server (orcaslicer-mcp #28). The connector finds either
+# by itself (its discovery.py), so the number appears in no setup.
+DEFAULT_PORT = 13131
+# The plugin's default up to 0.2.3. A stored port of 13130 saved by one of those versions moves to DEFAULT_PORT once
+# (moves_old_port); one saved by 0.2.4 or later is a choice and stays.
+OLD_DEFAULT_PORT = 13130
+PORT_MOVED_IN = (0, 2, 4)
 BIND_HOST = "127.0.0.1"
 MAX_BODY = 4 * 1024 * 1024
 UI_TIMEOUT_S = 10.0
@@ -1322,6 +1329,18 @@ class _Server(http.server.HTTPServer):
             self._beat = now
             trace("server loop alive")
 
+    def handle_error(self, request, client_address):
+        """A request that ended in an exception. socketserver's own version prints a traceback, and formatting one
+        inside stock OrcaSlicer reads files in a way its permission check cannot name: on Windows each one opened a
+        "Plugin permission request ... audit event open" window, several per failed request (live test, 2026-11-18).
+        An AI app that closes or stops waiting fails the next read or write here (WinError 10053/10054), so those
+        windows came up whenever the app, or the connector inside it, went away. A client that hung up is no error
+        at all; anything else gets one trace line, never a traceback."""
+        e = sys.exc_info()[1]
+        if isinstance(e, (ConnectionError, TimeoutError)):
+            return
+        trace(f"request failed: {type(e).__name__}: {e}")
+
     def server_bind(self):
         if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
@@ -1849,9 +1868,20 @@ def _remove_quietly(path: str) -> None:
         pass
 
 
-def remove_connection_file(folder: str) -> None:
-    for name in (CONNECTION_FILE, CONNECTION_FILE + ".tmp"):
-        _remove_quietly(os.path.join(folder, name))
+def remove_own_connection_file(folder: str) -> None:
+    """Remove connection.json, but only when this OrcaSlicer wrote it. Two OrcaSlicers can share one settings folder
+    and so this file: the OrcaSlicer MCP build loads the plugin too (it stays off there), and a second stock OrcaSlicer's
+    plugin can't get the port. Neither may take away the file of the one that serves (live test, 2026-11-18: the build
+    starting removed it). A file left by a crash is overwritten at the next start, and the connector puts it last,
+    since its process is gone."""
+    path = os.path.join(folder, CONNECTION_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            pid = json.load(f).get("pid")
+    except (OSError, ValueError, AttributeError):
+        return
+    if pid == os.getpid():
+        _remove_quietly(path)
 
 
 def load_or_create_token(folder: str, renew: bool = False) -> str:
@@ -1877,6 +1907,22 @@ def load_settings(folder: str) -> dict:
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _version_tuple(text) -> tuple:
+    """"0.2.3" -> (0, 2, 3); anything else -> (0,), older than every release."""
+    try:
+        return tuple(int(part) for part in str(text).strip().split("."))
+    except ValueError:
+        return (0,)
+
+
+def moves_old_port(port, config_version) -> bool:
+    """A stored port of 13130 that plugin 0.2.3 or older saved (or a host that can't say which version saved it) is
+    the old default: only the Config tab's Restore defaults, or a save of the port it showed, stored it. It moves to
+    DEFAULT_PORT, so the plugin no longer takes the build's port."""
+    return port == OLD_DEFAULT_PORT and \
+        _version_tuple(config_version) < PORT_MOVED_IN
 
 
 def load_port(folder: str) -> int:
@@ -3171,6 +3217,22 @@ class McpCapability(orca.script.ScriptPluginCapabilityBase):
             return {}
         return cfg if isinstance(cfg, dict) else {}
 
+    def _config_version(self) -> str:
+        """The plugin version that last saved the config ("" when never saved or the host can't say)."""
+        try:
+            return str(self.get_config_version() or "")
+        except Exception:
+            return ""
+
+    def _save_moved_port(self, cfg: dict, port: int) -> None:
+        """Store the new port, so the Config tab shows it and the move happens once. OrcaSlicer's config store
+        takes its own lock, so this is safe from the loading thread."""
+        try:
+            self.save_config(json.dumps({**cfg, "port": port}))
+            trace(f"port moved from {OLD_DEFAULT_PORT} (the build's) to {port}")
+        except Exception as e:
+            trace(f"moved port not saved: {type(e).__name__}: {e}")
+
     def _on_seen(self, app: str) -> None:  # server thread: an AI app reached OrcaSlicer
         with self._lock:
             prev = self._seen
@@ -3245,7 +3307,6 @@ class McpCapability(orca.script.ScriptPluginCapabilityBase):
             if missing:
                 raise RuntimeError(NEEDS_NEWER_TEXT.format(missing=", ".join(missing)))
             self._folder = orca.host.plugin.storage()
-            remove_connection_file(self._folder)  # one left by a crash would point the connector at a dead server
             settings = load_settings(self._folder)
             if settings.get("trace") is True:
                 _TRACE_PATH = os.path.join(self._folder, "plugin-trace.log")
@@ -3262,7 +3323,13 @@ class McpCapability(orca.script.ScriptPluginCapabilityBase):
             opened = (cfg.get("open") or {}).get("n", 0) if isinstance(cfg.get("open"), dict) else 0
             self._open_seen = opened if isinstance(opened, int) and not isinstance(opened, bool) else 0
             self._token = load_or_create_token(self._folder)
-            port = settings.get("port") if "port" in settings else cfg.get("port", DEFAULT_PORT)
+            if "port" in settings:
+                port = settings.get("port")
+            else:
+                port = cfg.get("port", DEFAULT_PORT)
+                if moves_old_port(port, self._config_version()):
+                    port = DEFAULT_PORT
+                    self._save_moved_port(cfg, port)
             self._port = port if isinstance(port, int) and not isinstance(port, bool) and \
                 (port == 0 or 1024 <= port <= 65535) else DEFAULT_PORT
             self.host = PanelHost(self._folder, self._post, self._notify)
@@ -3286,7 +3353,7 @@ class McpCapability(orca.script.ScriptPluginCapabilityBase):
                 else f"{type(e).__name__}: {e}"
             self._service = None
             if self._folder:
-                remove_connection_file(self._folder)
+                remove_own_connection_file(self._folder)
             trace("on_load failed: " + self._error)
             self._notify("could not start: " + self._error, True)
             print(f"[orcaslicer-mcp-plugin] not started: {self._error}")
@@ -3308,7 +3375,7 @@ class McpCapability(orca.script.ScriptPluginCapabilityBase):
             self._service.stop()
             trace(f"server stopped, thread alive={self._service.thread.is_alive()}")
             self._service = None
-            remove_connection_file(self._folder)
+            remove_own_connection_file(self._folder)
         if self.host is not None:
             self.host.save()
         panel, self._panel = self._panel, None

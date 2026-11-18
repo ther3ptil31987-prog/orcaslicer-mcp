@@ -1,4 +1,5 @@
 import json
+import os
 import time
 
 import fake_orca
@@ -386,13 +387,14 @@ def test_requests_record_which_app_connected_for_the_config_tab(plugin):
     assert S.config["status"] == codex  # put back at once
 
 
-def test_a_plugin_that_cannot_start_leaves_no_connection_file(tmp_path, monkeypatch):
-    """A file left by a crash is removed at load; if the server then can't start, none is written, so the connector
-    doesn't send this plugin's token to whatever owns the port now."""
+def test_a_plugin_that_cannot_start_leaves_the_other_ones_file(tmp_path, monkeypatch):
+    """Two OrcaSlicers share one settings folder: when this plugin can't get the port, the file belongs to the one that
+    has it, and stays, so the connector still finds that one."""
     storage = tmp_path / "orca_plugins" / "plugin_data" / "orcaslicer_mcp_plugin"
     storage.mkdir(parents=True)
     fake_orca.STATE.reset(storage=str(storage))
-    (storage / "connection.json").write_text(json.dumps({"product": "orcaslicer-mcp-plugin", "url": "x", "token": "y"}))
+    other = {"product": "orcaslicer-mcp-plugin", "url": "http://127.0.0.1:13131", "token": "y", "pid": os.getpid() + 1}
+    (storage / "connection.json").write_text(json.dumps(other))
 
     class Broken:
         def __init__(self, *a, **k):
@@ -401,9 +403,40 @@ def test_a_plugin_that_cannot_start_leaves_no_connection_file(tmp_path, monkeypa
     cap = mod.McpCapability()
     cap.on_load()
     try:
-        assert cap._error and not (storage / "connection.json").exists()
+        assert cap._error and json.loads((storage / "connection.json").read_text()) == other
     finally:
         cap.on_unload()
+    assert json.loads((storage / "connection.json").read_text()) == other
+
+
+def test_the_plugin_inside_the_build_leaves_the_file_alone(tmp_path, monkeypatch):
+    """The OrcaSlicer MCP build loads the plugin from the same settings folder and keeps it off; starting it must not
+    take away the file of a stock OrcaSlicer whose plugin serves (it did, live test 2026-11-18)."""
+    storage = tmp_path / "orca_plugins" / "plugin_data" / "orcaslicer_mcp_plugin"
+    storage.mkdir(parents=True)
+    fake_orca.STATE.reset(storage=str(storage))
+    other = {"product": "orcaslicer-mcp-plugin", "url": "http://127.0.0.1:13131", "token": "y", "pid": os.getpid() + 1}
+    (storage / "connection.json").write_text(json.dumps(other))
+    monkeypatch.setattr(mod, "running_in_mcp_build", lambda info=None: True)
+    cap = mod.McpCapability()
+    fake_orca.UI.run_blocking(cap.on_load)
+    assert cap._in_build and cap._service is None
+    cap.on_unload()
+    assert json.loads((storage / "connection.json").read_text()) == other
+
+
+def test_only_its_own_file_is_removed(tmp_path):
+    f = tmp_path / "connection.json"
+    f.write_text(json.dumps({"pid": os.getpid() + 1}))
+    mod.remove_own_connection_file(str(tmp_path))
+    assert f.exists()
+    f.write_text("{half written")
+    mod.remove_own_connection_file(str(tmp_path))
+    assert f.exists()
+    f.write_text(json.dumps({"pid": os.getpid()}))
+    mod.remove_own_connection_file(str(tmp_path))
+    assert not f.exists()
+    mod.remove_own_connection_file(str(tmp_path))  # nothing there: fine
 
 
 def test_the_connection_file_is_written_through_its_path(tmp_path, monkeypatch):
@@ -427,9 +460,10 @@ def test_a_failed_connection_write_leaves_nothing_behind(tmp_path, monkeypatch):
     with pytest.raises(PermissionError):
         mod.write_connection_file(str(tmp_path), 13130, "t" * 48)
     assert list(tmp_path.iterdir()) == []
-    (tmp_path / "connection.json.tmp").write_text("{}")
-    mod.remove_connection_file(str(tmp_path))  # a .tmp left by an older version goes too
-    assert list(tmp_path.iterdir()) == []
+    monkeypatch.undo()
+    (tmp_path / "connection.json.tmp").write_text("{}")  # left by an older version: the next write takes it over
+    mod.write_connection_file(str(tmp_path), 13131, "t" * 48)
+    assert [p.name for p in tmp_path.iterdir()] == ["connection.json"]
 
 
 def test_activated_inside_the_mcp_build_it_starts_nothing(tmp_path, monkeypatch):
@@ -461,3 +495,45 @@ def test_inside_the_mcp_build_it_asks_for_no_permissions(monkeypatch):
                         raising=False)
     mod.OrcaSlicerMcpPlugin().register_capabilities()
     assert S.permissions is None and mod.orca.registered == [mod.McpCapability]
+
+
+def _no_tracebacks(monkeypatch):
+    """Formatting a traceback inside stock OrcaSlicer pops a permission window on Windows (handle_error)."""
+    import traceback
+    used = []
+    for name in ("print_exc", "format_exc", "print_exception", "format_exception"):
+        monkeypatch.setattr(traceback, name, lambda *a, _n=name, **k: used.append(_n) or "")
+    return used
+
+
+def test_a_client_that_drops_the_connection_is_no_error(plugin, monkeypatch):
+    """The AI app (or its connector) closing a kept-alive connection resets it, and the server's next read fails.
+    That must stay quiet: no traceback, and the server goes on answering."""
+    import socket
+    import struct
+    used = _no_tracebacks(monkeypatch)
+    errors = []
+    orig = plugin._service.server.handle_error
+    monkeypatch.setattr(plugin._service.server, "handle_error",
+                        lambda req, addr: (errors.append(mod.sys.exc_info()[0]), orig(req, addr)))
+    s = socket.create_connection(("127.0.0.1", plugin._service.port), timeout=5)
+    s.sendall(("GET /api/v1/status HTTP/1.1\r\nHost: x\r\nX-Api-Token: %s\r\n\r\n" % plugin._token).encode())
+    assert s.recv(64).startswith(b"HTTP/1.1 200")
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    s.close()  # a reset, as when the app's process ends
+    time.sleep(0.5)
+    assert errors and all(issubclass(e, ConnectionError) for e in errors)
+    assert used == []
+    status, _ = call(plugin, "GET", "/api/v1/status")
+    assert status == 200
+
+
+def test_another_request_error_is_one_trace_line(plugin, monkeypatch, tmp_path):
+    used = _no_tracebacks(monkeypatch)
+    log = tmp_path / "trace.log"
+    monkeypatch.setattr(mod, "_TRACE_PATH", str(log))
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        plugin._service.server.handle_error(None, ("127.0.0.1", 1))
+    assert used == [] and "request failed: ValueError: boom" in log.read_text()
